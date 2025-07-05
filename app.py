@@ -5,9 +5,9 @@ from datetime import datetime
 from flask_cors import CORS
 import logging
 from typing import Dict, Any, Union
-import os
 import sklearn
 import numpy as np
+from sklearn.preprocessing import OneHotEncoder
 
 app = Flask(__name__)
 CORS(app)
@@ -15,12 +15,11 @@ CORS(app)
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Log scikit-learn version
 logger.info(f"Using scikit-learn version: {sklearn.__version__}")
 
 # Initialize model and metadata
 model = None
+encoder = None
 FEATURE_NAMES = [
     'Age', 'Location', 'ChronicalCondition', 'PreviousPregnancyComplication',
     'GestationAge', 'Gravidity', 'Parity', 'AntenatalVisit', 'Systolic',
@@ -41,39 +40,61 @@ def load_model_with_fallback(filepath):
     try:
         loaded_data = load(filepath)
         
-        # Case 1: Full model data dictionary
         if isinstance(loaded_data, dict):
             model = loaded_data.get('model')
+            encoder = loaded_data.get('encoder')
             feature_names = loaded_data.get('feature_names', FEATURE_NAMES)
             categorical_cols = loaded_data.get('categorical_cols', CATEGORICAL_COLS)
             numerical_cols = loaded_data.get('numerical_cols', NUMERICAL_COLS)
-            return model, feature_names, categorical_cols, numerical_cols
-        
-        # Case 2: Just the model object
+            return model, encoder, feature_names, categorical_cols, numerical_cols
         elif hasattr(loaded_data, 'predict'):
             logger.warning("Loaded file contains only model object, using default feature names")
-            return loaded_data, FEATURE_NAMES, CATEGORICAL_COLS, NUMERICAL_COLS
-        
-        # Case 3: Unknown format
+            return loaded_data, None, FEATURE_NAMES, CATEGORICAL_COLS, NUMERICAL_COLS
         else:
             raise ValueError("Unknown model file format")
-    
     except Exception as e:
         logger.error(f"Model loading failed: {str(e)}")
         raise
 
 # Load the model
 try:
-    model, FEATURE_NAMES, CATEGORICAL_COLS, NUMERICAL_COLS = load_model_with_fallback(
+    model, encoder, FEATURE_NAMES, CATEGORICAL_COLS, NUMERICAL_COLS = load_model_with_fallback(
         'model/maternal_risk_predictor(1).pkl'
     )
     logger.info("Model and metadata loaded successfully")
     
-    # Test the model with dummy data
-    test_input = pd.DataFrame([{col: 0 for col in FEATURE_NAMES}])
+    # Create proper test data with correct values
+    test_data = {
+        'Age': 25,
+        'Location': 'Urban',
+        'ChronicalCondition': 'No',
+        'PreviousPregnancyComplication': 'No',
+        'GestationAge': 38,
+        'Gravidity': 2,
+        'Parity': 1,
+        'AntenatalVisit': 4,
+        'Systolic': 120,
+        'Dystolic': 80,
+        'PulseRate': 70,
+        'SpecificComplication': 'No',
+        'DeliveryMode': 'Spontaneous Vertex Delivery',
+        'StaffConductedDelivery': 'Skilled'
+    }
+    
+    # Prepare test data
+    test_df = pd.DataFrame([test_data])
+    
+    if encoder:
+        # If we have an encoder, use it to transform categorical features
+        encoded_categorical = encoder.transform(test_df[CATEGORICAL_COLS])
+        encoded_df = pd.DataFrame(encoded_categorical, 
+                                columns=encoder.get_feature_names_out(CATEGORICAL_COLS))
+        numerical_df = test_df[NUMERICAL_COLS]
+        test_df = pd.concat([numerical_df, encoded_df], axis=1)
+    
     try:
-        model.predict(test_input)
-        logger.info("Model test prediction successful")
+        prediction = model.predict(test_df)
+        logger.info(f"Model test successful. Prediction: {prediction}")
     except Exception as e:
         logger.error(f"Model test failed: {str(e)}")
         raise
@@ -139,7 +160,6 @@ def validate_input(data: Dict[str, Any]) -> Union[None, Dict[str, str]]:
         except ValueError:
             type_errors.append(f"{field} must be a number")
     
-    # Value range validation
     if 'age' in data and (float(data['age']) < 10 or float(data['age']) > 60):
         type_errors.append("Age must be between 10 and 60 years")
     if 'gestationAge' in data and (float(data['gestationAge']) < 0 or float(data['gestationAge']) > 45):
@@ -157,20 +177,23 @@ def validate_input(data: Dict[str, Any]) -> Union[None, Dict[str, str]]:
     return None
 
 def prepare_input_data(api_data: Dict[str, Any]) -> pd.DataFrame:
-    """Convert API input to model-ready DataFrame with correct feature names"""
+    """Convert API input to model-ready DataFrame"""
     mapped_data = {
         FEATURE_MAPPING[k]: v 
         for k, v in api_data.items() 
         if k in FEATURE_MAPPING
     }
     
-    # Ensure correct data types
-    for field in NUMERICAL_COLS:
-        if field in mapped_data:
-            mapped_data[field] = float(mapped_data[field])
+    # Create DataFrame with raw values
+    input_df = pd.DataFrame([mapped_data])
     
-    # Create DataFrame with columns in correct order
-    input_df = pd.DataFrame([mapped_data], columns=FEATURE_NAMES)
+    if encoder:
+        # One-hot encode categorical features
+        encoded_categorical = encoder.transform(input_df[CATEGORICAL_COLS])
+        encoded_df = pd.DataFrame(encoded_categorical, 
+                                columns=encoder.get_feature_names_out(CATEGORICAL_COLS))
+        numerical_df = input_df[NUMERICAL_COLS]
+        input_df = pd.concat([numerical_df, encoded_df], axis=1)
     
     return input_df
 
@@ -189,7 +212,6 @@ def predict():
     try:
         logger.info("Received prediction request")
         
-        # Get and validate input
         data = request.get_json()
         if not data:
             logger.error("No JSON data received")
@@ -200,15 +222,12 @@ def predict():
             logger.error(f"Validation error: {validation_error['error']}")
             return jsonify(validation_error), 400
         
-        # Prepare input data
         input_df = prepare_input_data(data)
-        logger.info(f"Input data prepared: {input_df.to_dict()}")
+        logger.info(f"Input data prepared with columns: {input_df.columns.tolist()}")
         
-        # Make prediction
         predicted_class = model.predict(input_df)[0]
         prediction_proba = model.predict_proba(input_df)[0][1]  # Probability of High Risk
         
-        # Prepare response
         status = "High" if predicted_class == 1 else "Low"
         response = {
             "patientId": data.get('patientId', ''),
@@ -217,7 +236,7 @@ def predict():
             "probability": round(float(prediction_proba), 4),
             "recommendations": RECOMMENDATIONS[status],
             "timestamp": datetime.now().isoformat(),
-            "inputFeatures": input_df.iloc[0].to_dict()
+            "inputFeatures": data  # Return original input features
         }
         
         logger.info(f"Prediction successful: {response}")
